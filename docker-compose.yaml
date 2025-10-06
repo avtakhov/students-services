@@ -2,35 +2,38 @@ services:
   stats:
     build:
       context: ./stats
-    container_name: stats
-    volumes:
-      - ./data/stats:/data
     environment:
       DATABASE_URL: sqlite+aiosqlite:////data/events.db
+    volumes:
+      - stats_data:/data
+    restart: unless-stopped
     networks: [appnet]
 
   stats-tg:
     build:
       context: ./stats-tg
-    container_name: stats-tg
+    # container_name: stats-tg
     env_file: stats-tg/.env
     environment:
       DATABASE_PATH: /data/chats.db
-      PUBLIC_BASE_URL: http://localhost
       API_BASE_URL: http://stats:8000
-#      SSL_CERT_FILE: /etc/ssl/ssl.pem
-#      SSL_KEY_FILE: /etc/ssl/ssl.key
+      # SSL_CERT_PATH: /etc/certs/ssl.pem
+      # SSL_KEY_PATH:  /etc/certs/ssl.key
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000
     volumes:
-      - ./data/stats-tg:/data
-      - ./certs:/etc/ssl:ro
+      - stats_tg_data:/data
     ports:
       - "8080:8000"
+    depends_on:
+      stats:
+        condition: service_healthy
+    restart: unless-stopped
     networks: [appnet]
+
 
   vk-bot:
     build:
       context: ./vk-bot
-    container_name: vk-bot
     env_file: vk-bot/.env
     environment:
       SERVER_URL: http://stats:8000
@@ -38,3 +41,7 @@ services:
 
 networks:
   appnet: {}
+
+volumes:
+  stats_data: {}
+  stats_tg_data: {}
