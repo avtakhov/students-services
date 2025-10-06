@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Статистика {{ qr_id|upper }}</title>
+  <style>
+    :root { --bg:#0b0f17; --panel:#121826; --muted:#8ea0b4; --text:#e7eef7; --accent:#7aa2ff; --grid:#1b2333; --ok:#6ad68b; }
+    body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { max-width:1100px; margin:32px auto; padding:0 16px; }
+    .title { font-size:28px; font-weight:700; }
+    .period { color:var(--muted); font-size:14px; margin-bottom:16px; }
+    .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin:20px 0 24px; }
+    .card { background:var(--panel); border:1px solid var(--grid); border-radius:14px; padding:14px 16px; }
+    .label { color:var(--muted); font-size:13px; }
+    .value { font-size:28px; font-weight:800; margin-top:6px; }
+    table { width:100%; border-collapse:collapse; border-radius:10px; overflow:hidden; border:1px solid var(--grid); background:var(--panel); }
+    th,td { padding:10px 14px; border-bottom:1px solid var(--grid); }
+    th { color:var(--muted); text-align:left; font-size:13px; }
+    td.subscribed { color:var(--ok); font-weight:700; }
+    td.link a { color:var(--accent); text-decoration:none; }
+    td.link a:hover { text-decoration:underline; }
+    .pill { border:1px solid var(--grid); border-radius:999px; padding:4px 8px; font-size:12px; color:var(--muted); margin-right:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">Статистика {{ qr_id|upper }}</div>
+    <div class="period">Период: {{ fmt_from }} — {{ fmt_to }}</div>
+
+    <div>
+      <span class="pill">Событий: {{ events_count }}</span>
+      <span class="pill">Пользователей: {{ users|length }}</span>
+    </div>
+
+    <div class="summary">
+      <div class="card"><div class="label">Посещений</div><div class="value">{{ visits }}</div></div>
+      <div class="card"><div class="label">Подписок</div><div class="value">{{ subs }}</div></div>
+      <div class="card"><div class="label">Отписок</div><div class="value">{{ unsubs }}</div></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr><th>#</th><th>ФИО</th><th>События</th><th>Подписался</th><th>Ссылка</th></tr>
+      </thead>
+      <tbody>
+        {% if users %}
+          {% for uid, user in users.items() %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ user.last_name }} {{ user.first_name }}</td>
+            <td>
+              {% for ts, etype, payload in user.events %}
+                {% set label = 'посещение' if etype in EVENT_VISIT else ('подписка' if etype in EVENT_SUB else ('отписка' if etype in EVENT_UNSUB else etype)) %}
+                {{ fmt_local(ts) }} — {{ label }}<br>
+              {% endfor %}
+            </td>
+            <td class="subscribed">{{ 'да' if user.subscribed_in_range else 'нет' }}</td>
+            <td class="link"><a href="{{ user.link }}" target="_blank">страница</a></td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px;">Нет событий за указанный период</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
