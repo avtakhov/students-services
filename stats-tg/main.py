@@ -67,6 +67,12 @@ STATS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Новый регекс для /stats qr1 (без даты)
+STATS_TODAY_RE = re.compile(
+    r"^/stats\s+(\S+)$",
+    re.IGNORECASE,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -128,9 +134,8 @@ async def api_search_async(
 ) -> Dict[str, Any]:
     assert _http_client is not None, "HTTP client not initialized"
     url = f"{API_BASE_URL}{API_SEARCH_PATH}"
-    payload: Dict[str, Any] = {"from": to_iso(dt_from), "to": to_iso(dt_to)}
-    if qr_id:
-        payload["qr_id"] = qr_id
+    payload: Dict[str, Any] = {"from": to_iso(dt_from), "to": to_iso(dt_to), "qr_id": qr_id}
+
     log.debug("POST %s payload=%s headers=%s", url, payload, API_HEADERS)
     r = await _http_client.post(url, json=payload, headers=API_HEADERS, timeout=30)
     r.raise_for_status()
@@ -193,15 +198,9 @@ def group_user_events(events: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]
 
 
 def summarize_counts(events: List[Dict[str, Any]]) -> Tuple[int, int, int]:
-    visits = subs = unsubs = 0
-    for e in events:
-        et = e.get("event_type")
-        if et in EVENT_VISIT:
-            visits += 1
-        elif et in EVENT_SUB:
-            subs += 1
-        elif et in EVENT_UNSUB:
-            unsubs += 1
+    visits = sum(1 for e in events if e.get("event_type") in EVENT_VISIT)
+    subs = sum(1 for e in events if e.get("event_type") in EVENT_SUB)
+    unsubs = sum(1 for e in events if e.get("event_type") in EVENT_UNSUB)
     return visits, subs, unsubs
 
 def summarize_counts_by_qr(events: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int, int]]:
@@ -419,31 +418,84 @@ async def list_chats_async() -> list[int]:
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     m = STATS_RE.match(text)
-    if not m:
-        await update.message.reply_text(
-            "Неверный формат. Пример:\n/stats qr1 07.09.2025 14:00 - 08.09.2025 11:00"
-        )
-        return
-
-    qr_id, from_s, to_s = m.groups()
-    try:
-        dt_from = parse_local_dt(from_s)
-        dt_to = parse_local_dt(to_s)
-        if dt_to <= dt_from:
-            raise ValueError("Период пустой")
-    except Exception:
-        await update.message.reply_text(
-            "Не удалось распознать даты. Проверьте формат DD.MM.YYYY HH:MM."
-        )
-        return
+    if m:
+        qr_id, from_s, to_s = m.groups()
+        try:
+            dt_from = parse_local_dt(from_s)
+            dt_to = parse_local_dt(to_s)
+            if dt_to <= dt_from:
+                raise ValueError("Период пустой")
+        except Exception:
+            await update.message.reply_text(
+                "Не удалось распознать даты. Проверьте формат DD.MM.YYYY HH:MM."
+            )
+            return
+    else:
+        # Пробуем формат без даты (/stats qr1)
+        m_today = STATS_TODAY_RE.match(text)
+        if m_today:
+            qr_id = m_today.group(1)
+            # Берем сегодняшний день с 00:00 до текущего момента
+            now_loc = datetime.now(LOCAL_TZ)
+            dt_from = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
+            dt_to = now_loc
+        else:
+            await update.message.reply_text(
+                "Неверный формат. Примеры:\n"
+                "/stats qr1 — статистика за сегодня\n"
+                "/stats qr1 07.09.2025 14:00 - 08.09.2025 11:00 — за период"
+            )
+            return
 
     try:
         data = await api_search_async(qr_id, dt_from, dt_to)
         events = data.get("events") or []
+
+        # Проверяем, есть ли события с таким qr_id
+        qr_exists = False
+        for ev in events:
+            payload = ev.get("payload") or {}
+            ev_qr = payload.get("qr_id") or payload.get("qrId")
+            if ev_qr and ev_qr.lower() == qr_id.lower():
+                qr_exists = True
+                break
+
+        # Если событий нет вообще или нет событий с таким qr_id, проверяем существование
+        if not events or not qr_exists:
+            # Делаем запрос на большой период (последний год) для проверки существования
+            check_from = datetime.now(LOCAL_TZ) - timedelta(days=365)
+            check_to = datetime.now(LOCAL_TZ)
+            check_data = await api_search_async(qr_id, check_from, check_to)
+            check_events = check_data.get("events") or []
+
+            # Проверяем, есть ли вообще такой QR в системе
+            qr_found_ever = False
+            for ev in check_events:
+                payload = ev.get("payload") or {}
+                ev_qr = payload.get("qr_id") or payload.get("qrId")
+                if ev_qr and ev_qr.lower() == qr_id.lower():
+                    qr_found_ever = True
+                    break
+
+            if not qr_found_ever:
+                await update.message.reply_text(
+                    f"❌ QR-код '{qr_id}' не найден в системе.\n"
+                    f"Проверьте правильность написания."
+                )
+                return
+
         msg = build_summary_message(qr_id, dt_from, dt_to, events)
         await update.message.reply_text(
             msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True
         )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            await update.message.reply_text(
+                f"❌ QR-код '{qr_id}' не найден в системе."
+            )
+        else:
+            log.exception("stats_cmd failed with HTTP error")
+            await update.message.reply_text(f"Ошибка при получении данных: {e}")
     except Exception as e:
         log.exception("stats_cmd failed")
         await update.message.reply_text(f"Ошибка при получении данных: {e}")
@@ -452,7 +504,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я считаю статистику по QR.\n"
         "Формат запроса:\n"
-        "/stats qr1 07.09.2025 14:00 - 08.09.2025 11:00\n\n"
         "Каждый день в 21:00 МСК я отправляю сводку по всем QR."
     )
 
@@ -468,12 +519,12 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
         results = await api_search_async(None, day_start, day_end)
         events = results.get("events") or []
         per_qr = summarize_counts_by_qr(events)
-        lines = ["Статистика по всем QR за сегодня."]
+        lines = ["Статистика по всем QR за сегодня.\n"]
         for qr_id, (visits, subs, unsubs) in per_qr.items():
             lines.append(f"{qr_id}:")
             lines.append(f"Посещений: {visits}")
             lines.append(f"Подписок: {subs}")
-            lines.append(f"Отписок: {unsubs}")
+            lines.append(f"Отписок: {unsubs}\n")
         if not per_qr:
             lines.append("Событий не найдено.")
         msg = "\n".join(lines)
@@ -485,6 +536,7 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=chat_id, text=f"Ошибка при составлении сводки: {e}"
         )
+
 
 async def enable_digest_for_chat(update, context):
     await add_chat_async(update.effective_chat.id)
@@ -501,12 +553,14 @@ async def enable_digest_for_chat(update, context):
     # планируем
     context.job_queue.run_daily(
         callback=daily_digest,
-        time=time(hour=21, minute=0, tzinfo=LOCAL_TZ),
+        time=time(hour=0, minute=50, tzinfo=LOCAL_TZ),
         name=f"digest_{chat_id}",
         data={"chat_id": chat_id},
         job_kwargs={"misfire_grace_time": 300, "coalesce": True},
     )
+
     await update.message.reply_text("✅ Ежедневная сводка включена (21:00 МСК).")
+
 
 async def disable_digest_for_chat(update, context):
     chat_id = update.effective_chat.id
@@ -522,8 +576,10 @@ async def disable_digest_for_chat(update, context):
         else "ℹ️ Сводка уже была отключена."
     )
 
+
 # === создание и запуск Telegram-приложения (в lifecycle FastAPI) ===
 _tg_app: Optional[Application] = None
+
 
 async def _start_telegram():
     global _tg_app
@@ -538,9 +594,10 @@ async def _start_telegram():
     for chat_id in await list_chats_async():
         _tg_app.job_queue.run_daily(
             callback=daily_digest,
-            time=time(hour=21, minute=0, tzinfo=LOCAL_TZ),
+            time=time(hour=0, minute=55, tzinfo=LOCAL_TZ),
             name=f"digest_{chat_id}",
             data={"chat_id": chat_id},
+            job_kwargs={"misfire_grace_time": 300, "coalesce": True},
         )
         log.info("Restored daily digest for chat %s", chat_id)
 

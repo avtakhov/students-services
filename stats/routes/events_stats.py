@@ -15,7 +15,7 @@ router = APIRouter()
 
 
 class SearchRequest(pydantic.BaseModel):
-    qr_id: str
+    qr_id: str | None
     from_: datetime.datetime | None = Field(default=None, alias="from")
     to_: datetime.datetime | None = Field(default=None, alias="to")
     limit: int = 100
