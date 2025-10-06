@@ -19,15 +19,10 @@ services:
       API_BASE_URL: http://stats:8000
       # SSL_CERT_PATH: /etc/certs/ssl.pem
       # SSL_KEY_PATH:  /etc/certs/ssl.key
-    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000
     volumes:
       - stats_tg_data:/data
     ports:
-      - "8080:8000"
-    depends_on:
-      stats:
-        condition: service_healthy
-    restart: unless-stopped
+      - "80:8000"
     networks: [appnet]
 
 
