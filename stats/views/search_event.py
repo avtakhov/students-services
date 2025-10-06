@@ -29,7 +29,7 @@ class SearchEventResult(pydantic.BaseModel):
 
 
 async def search_event(
-    qr_id: str,
+    qr_id: str | None,
     from_: dt.datetime,
     to_: dt.datetime,
     session: AsyncSession,
@@ -37,10 +37,13 @@ async def search_event(
     cursor: str | None,
 ) -> SearchEventResult:
     conds = [
-        EventDB.qr_id == qr_id,
         EventDB.timestamp >= from_,
         EventDB.timestamp <= to_,
     ]
+
+    # Добавляем условие qr_id только если оно указано
+    if qr_id is not None:
+        conds.append(EventDB.qr_id == qr_id)
 
     if cursor:
         cur_ts, cur_id = _decode_cursor(cursor)
