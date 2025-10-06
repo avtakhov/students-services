@@ -1,0 +1,40 @@
+services:
+  stats:
+    build:
+      context: ./stats
+    container_name: stats
+    volumes:
+      - ./data/stats:/data
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/events.db
+    networks: [appnet]
+
+  stats-tg:
+    build:
+      context: ./stats-tg
+    container_name: stats-tg
+    env_file: stats-tg/.env
+    environment:
+      DATABASE_PATH: /data/chats.db
+      PUBLIC_BASE_URL: http://localhost
+      API_BASE_URL: http://stats:8000
+#      SSL_CERT_FILE: /etc/ssl/ssl.pem
+#      SSL_KEY_FILE: /etc/ssl/ssl.key
+    volumes:
+      - ./data/stats-tg:/data
+      - ./certs:/etc/ssl:ro
+    ports:
+      - "8080:8000"
+    networks: [appnet]
+
+  vk-bot:
+    build:
+      context: ./vk-bot
+    container_name: vk-bot
+    env_file: vk-bot/.env
+    environment:
+      SERVER_URL: http://stats:8000
+    networks: [appnet]
+
+networks:
+  appnet: {}
