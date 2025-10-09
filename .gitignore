@@ -3,4 +3,5 @@
 .env
 *.db
 /stats/events.db
+/students-services/*
 __pycache__
