@@ -16,7 +16,7 @@ import httpx
 import pytz
 from dateutil import parser as dateparser
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.templating import Jinja2Templates
@@ -99,6 +99,7 @@ def fmt_local(dt: datetime) -> str:
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0"}
 
+
 def is_localhost_url(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -106,10 +107,12 @@ def is_localhost_url(url: str) -> bool:
     except Exception:
         return False
 
+
 def make_markdown_link(text: str, url: str) -> str:
     # не экранируем text — он статический "Полная статистика"
     # url уже percent-encoded в build_stats_link
     return f"[{text}]({url})"
+
 
 templates.env.globals["fmt_local"] = fmt_local
 
@@ -355,6 +358,7 @@ def build_summary_message_stream_markdown(
         lines.append(link_markdown)
     return "\n".join(lines)
 
+
 def build_summary_message_stream_plain(
     qr_id: str,
     dt_from: datetime,
@@ -422,9 +426,14 @@ async def health():
 
 
 @app.get(
-    "/stats/{qr_id}/from={from_iso}&to={to_iso}", response_class=HTMLResponse
+    "/stats/{qr_id}", response_class=HTMLResponse
 )
-async def http_stats(qr_id: str, from_iso: str, to_iso: str, request: Request):
+async def http_stats(
+    qr_id: str,
+    request: Request,
+    from_iso: str = Query(..., alias="from"),
+    to_iso: str = Query(..., alias="to"),
+):
     try:
         dt_from = dateparser.isoparse(from_iso)
         dt_to = dateparser.isoparse(to_iso)
@@ -576,7 +585,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Проверьте правильность написания."
                 )
                 return
-
 
         link = build_stats_link(qr_id, dt_from, dt_to)
 
