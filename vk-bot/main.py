@@ -80,6 +80,7 @@ class VKPromoBot:
                 user_id=user_id,
                 message=text,
                 random_id=get_random_id(),
+                dont_parse_links=1
             )
         except Exception as e:
             logger.error("Ошибка messages.send: %s", e)
@@ -141,19 +142,43 @@ class VKPromoBot:
             return False
     # -------- HANDLERS --------
 
+    def handle_start_button(self, user_id: int):
+        """Обработчик нажатия кнопки 'Начать'"""
+        user = self._get_user_info(user_id)
+        if not user:
+            return
+
+        welcome_text = (
+            "Привет, студент!👋\n"
+            "Мы помогаем с любыми видами академических работ.\n\n"
+            "Хочешь получить бесплатную работу?\n"
+            "[https://vk.com/app7685942_-220116264|👉Крути рулетку]🎯\n\n"
+            "Если нужна помощь прямо сейчас — просто напиши сюда✍️\n"
+            "Для подписчиков действует скидка 30% на первый заказ!\n"
+            "[https://vk.com/studgenius|👉Подписаться]💥\n\n"
+            "Твой личный менеджер ответит в течение 3 минут.\n"
+            "Напиши, что тебе нужно — например: курсовая, статья или диплом — и мы сразу начнём работу )"
+        )
+
+        self._send_message(user_id, welcome_text)
+        logger.info("Отправлено приветствие пользователю %s (кнопка Начать)", user_id)
+
     def handle_message_new(self, obj: dict):
-        message = obj.get("message", obj)
+        # Унифицируем структуру входного объекта
+        message = obj.get("message") or obj
 
         user_id = message.get("from_id")
         if not user_id:
             return
 
+        # Берём текст (в некоторых версиях он лежит на верхнем уровне)
+
+        # Остальная логика обработки сообщений
         user = self._get_user_info(user_id)
         if not user:
             return
 
         ref = None
-
         payload = message.get("payload")
         if isinstance(payload, str):
             try:
@@ -162,11 +187,7 @@ class VKPromoBot:
                 payload = None
 
         if isinstance(payload, dict):
-
-            ref = payload.get("ref") or payload.get("qr_id") or payload.get(
-                "key"
-                )
-
+            ref = payload.get("ref") or payload.get("qr_id") or payload.get("key")
 
         if not ref:
             ref = (message.get("ref")
@@ -174,26 +195,30 @@ class VKPromoBot:
                    or message.get("ref_source")
                    or obj.get("ref_source"))
 
-
         event_payload = {"qr_id": ref} if ref else None
         if event_payload:
             event = self._build_event("Link", user, event_payload)
             self._post_event(event)
 
-        if self._is_first_message(user_id):
-            welcome_message = (
-                "Привет, студент! 👋\n"
-                "Мы помогаем с любыми видами академических работ.\n"
-                "Хочешь получить бесплатную работу?\n"
-                "[https://vk.com/app7685942_-220116264|👉Крути рулетку]\n"
-                "Если нужна помощь прямо сейчас — просто напиши сюда ✍️\n"
-                "Для подписчиков действует скидка 30% на первый заказ!\n"            
-                "[https://vk.com/studgenius|👉Подписаться]\n"
-                "Твой личный менеджер ответит в течение 3 минут.\n"
-                "Чтобы мы быстрее поняли, что тебе нужно, укажи кодовое слово: курсовая, статья или диплом."
-            )
-            self._send_message(user_id, welcome_message)
-            logger.info("Отправлено приветствие новому пользователю: %s", user_id)
+        text = (message.get("text") or obj.get("text") or "").strip().lower()
+
+        # Проверяем системную кнопку "Начать"
+        if text == "начать":
+            self.handle_start_button(user_id)
+            return  # ⚠️ Обязательно прерываем, чтобы не шло дальше
+
+        # Иногда системная кнопка может прийти с payload
+        payload_raw = message.get("payload")
+        if payload_raw:
+            try:
+                payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+                if isinstance(payload, dict) and payload.get("command") == "start":
+                    logger.info("Пользователь %s нажал кнопку 'Начать' (через payload)", user_id)
+                    self.handle_start_button(user_id)
+                    return
+            except Exception:
+                pass
+
 
     def handle_group_join(self, obj: dict):
         user_id = obj.get("user_id")
