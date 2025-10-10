@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import html
 import logging
 import os
 import pathlib
@@ -7,21 +8,19 @@ import re
 from collections import defaultdict
 from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Optional, Tuple, Iterable, AsyncIterator
+from urllib.parse import quote, urlparse
 
-import anyio
 import aiosqlite
-import pytz
 import httpx
+import pytz
 from dateutil import parser as dateparser
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.templating import Jinja2Templates
-from urllib.parse import quote
-
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -56,7 +55,8 @@ if _raw_hdr:
             k, v = part.split(":", 1)
             API_HEADERS[k.strip()] = v.strip()
 
-QR_IDS_ENV = [s.strip() for s in os.getenv("QR_IDS", "").split(",") if s.strip()]
+QR_IDS_ENV = [s.strip() for s in os.getenv("QR_IDS", "").split(",") if
+              s.strip()]
 
 EVENT_VISIT = {"Link", "Visit"}
 EVENT_SUB = {"Subscribe", "Subscription", "Follow"}
@@ -66,12 +66,7 @@ STATS_RE = re.compile(
     r"^/stats\s+(\S+)\s+(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\s*-\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})$",
     re.IGNORECASE,
 )
-
-# Новый регекс для /stats qr1 (без даты)
-STATS_TODAY_RE = re.compile(
-    r"^/stats\s+(\S+)$",
-    re.IGNORECASE,
-)
+STATS_TODAY_RE = re.compile(r"^/stats\s+(\S+)$", re.IGNORECASE)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +97,20 @@ def fmt_local(dt: datetime) -> str:
     return dt_loc.strftime("%d.%m.%Y %H:%M")
 
 
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0"}
+
+def is_localhost_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return host in LOCAL_HOSTS
+    except Exception:
+        return False
+
+def make_markdown_link(text: str, url: str) -> str:
+    # не экранируем text — он статический "Полная статистика"
+    # url уже percent-encoded в build_stats_link
+    return f"[{text}]({url})"
+
 templates.env.globals["fmt_local"] = fmt_local
 
 
@@ -116,11 +125,14 @@ def to_iso(dt: datetime) -> str:
 def build_stats_link(qr_id: str, dt_from: datetime, dt_to: datetime) -> str:
     if not PUBLIC_BASE_URL:
         return ""
+    base = PUBLIC_BASE_URL
+    if not base.startswith(("http://", "https://")):
+        base = "http://" + base
     f_iso = to_iso(dt_from)
     t_iso = to_iso(dt_to)
     f_q = quote(f_iso, safe="")
     t_q = quote(t_iso, safe="")
-    return f"{PUBLIC_BASE_URL}/stats/{qr_id}/from={f_q}&to={t_q}"
+    return f"{base}/stats/{qr_id}?from={f_q}&to={t_q}"
 
 
 # =========================
@@ -129,147 +141,205 @@ def build_stats_link(qr_id: str, dt_from: datetime, dt_to: datetime) -> str:
 
 _http_client: Optional[httpx.AsyncClient] = None
 
+
 async def api_search_async(
-    qr_id: Optional[str], dt_from: datetime, dt_to: datetime
-) -> Dict[str, Any]:
+    qr_id: Optional[str],
+    dt_from: datetime,
+    dt_to: datetime,
+    *,
+    limit: int = 100,
+    start_cursor: Optional[str] = None,
+    max_pages: Optional[int] = None,
+    max_events: Optional[int] = None,
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Асинхронный генератор событий (dict) из API, с автопагинацией.
+    """
     assert _http_client is not None, "HTTP client not initialized"
     url = f"{API_BASE_URL}{API_SEARCH_PATH}"
-    payload: Dict[str, Any] = {"from": to_iso(dt_from), "to": to_iso(dt_to), "qr_id": qr_id}
 
-    log.debug("POST %s payload=%s headers=%s", url, payload, API_HEADERS)
-    r = await _http_client.post(url, json=payload, headers=API_HEADERS, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, dict) or "events" not in data:
-        raise ValueError("Unexpected API response shape")
-    return data
+    cursor = start_cursor
+    total_events = 0
+    page_count = 0
 
+    while True:
+        payload: Dict[str, Any] = {
+            "from": to_iso(dt_from),
+            "to": to_iso(dt_to),
+            "qr_id": qr_id,
+            "limit": limit,
+        }
+        if cursor is not None:
+            payload["cursor"] = cursor
 
-# =========================
-# Вспомогательные функции
-# =========================
-
-def extract_qr_ids_from_events(events: List[Dict[str, Any]]) -> List[str]:
-    qs = []
-    for ev in events:
-        p = ev.get("payload") or {}
-        qr = p.get("qr_id") or p.get("qrId")
-        if qr and qr not in qs:
-            qs.append(qr)
-    return qs
-
-
-def group_user_events(events: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-    users: Dict[int, Dict[str, Any]] = {}
-    for ev in events:
-        info = ev.get("vk_user_info") or {}
-        uid = info.get("id")
-        if uid is None:
-            continue
-        bucket = users.setdefault(
-            uid,
-            {
-                "first_name": info.get("first_name") or "",
-                "last_name": info.get("last_name") or "",
-                "events": [],
-                "subscribed_in_range": False,
-                "link": f"https://vk.com/id{uid}",
-            },
+        log.debug("POST %s payload=%s headers=%s", url, payload, API_HEADERS)
+        r = await _http_client.post(
+            url, json=payload, headers=API_HEADERS, timeout=30
         )
-        ts_raw = ev.get("timestamp")
-        try:
-            ts = dateparser.isoparse(ts_raw)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
+        r.raise_for_status()
+        data = r.json()
 
-        etype = ev.get("event_type")
-        payload = ev.get("payload") or {}
+        if not isinstance(data, dict) or "events" not in data:
+            raise ValueError(f"Unexpected API response shape: {data}")
 
-        if etype in EVENT_SUB:
-            bucket["subscribed_in_range"] = True
+        events = data.get("events", [])
+        has_more = bool(data.get("has_more", False))
+        cursor = data.get("next_cursor")
 
-        bucket["events"].append((ts, etype, payload))
+        log.debug(
+            "Fetched page %d: %d events, has_more=%s, next_cursor=%s",
+            page_count + 1, len(events), has_more, cursor,
+        )
+
+        for event in events:
+            yield event
+            total_events += 1
+            if max_events is not None and total_events >= max_events:
+                log.info("Reached max_events=%s; stopping", max_events)
+                return
+
+        page_count += 1
+        if not has_more or not cursor:
+            break
+        if max_pages is not None and page_count >= max_pages:
+            log.info("Reached max_pages=%s; stopping pagination", max_pages)
+            break
+
+    log.debug(
+        "Completed fetching %d events in %d pages", total_events, page_count
+    )
+
+
+# =========================
+# Вспомогательные функции (стрим-агрегация)
+# =========================
+
+def escape_md(text: str) -> str:
+    return escape_markdown(text, version=2)
+
+
+def _inc_counts_for_event(
+    event: Dict[str, Any], counts: Dict[str, int]
+) -> None:
+    et = event.get("event_type")
+    if et in EVENT_VISIT:
+        counts["visits"] += 1
+    elif et in EVENT_SUB:
+        counts["subs"] += 1
+    elif et in EVENT_UNSUB:
+        counts["unsubs"] += 1
+
+
+def _add_event_to_users(
+    users: Dict[int, Dict[str, Any]], event: Dict[str, Any]
+) -> None:
+    info = event.get("vk_user_info") or {}
+    uid = info.get("id")
+    if uid is None:
+        return
+
+    bucket = users.setdefault(
+        uid,
+        {
+            "first_name": info.get("first_name") or "",
+            "last_name": info.get("last_name") or "",
+            "events": [],
+            "subscribed_in_range": False,
+            "link": f"https://vk.com/id{uid}",
+        },
+    )
+
+    ts_raw = event.get("timestamp")
+    try:
+        ts = dateparser.isoparse(ts_raw)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return
+
+    etype = event.get("event_type")
+    payload = event.get("payload") or {}
+
+    if etype in EVENT_SUB:
+        bucket["subscribed_in_range"] = True
+
+    bucket["events"].append((ts, etype, payload))
+
+
+async def fold_users_and_counts(
+    qr_id: Optional[str],
+    dt_from: datetime,
+    dt_to: datetime,
+) -> Tuple[Dict[int, Dict[str, Any]], int, int, int, int]:
+    """
+    Стримит события и инкрементально собирает:
+    - users: структура как раньше (с events по пользователям)
+    - visits/subs/unsubs
+    - events_count
+    """
+    users: Dict[int, Dict[str, Any]] = {}
+    counts = {"visits": 0, "subs": 0, "unsubs": 0}
+    events_count = 0
+
+    async for ev in api_search_async(qr_id, dt_from, dt_to):
+        _add_event_to_users(users, ev)
+        _inc_counts_for_event(ev, counts)
+        events_count += 1
 
     for b in users.values():
         b["events"].sort(key=lambda t: t[0])
-    return users
+
+    return users, counts["visits"], counts["subs"], counts[
+        "unsubs"], events_count
 
 
-def summarize_counts(events: List[Dict[str, Any]]) -> Tuple[int, int, int]:
-    visits = sum(1 for e in events if e.get("event_type") in EVENT_VISIT)
-    subs = sum(1 for e in events if e.get("event_type") in EVENT_SUB)
-    unsubs = sum(1 for e in events if e.get("event_type") in EVENT_UNSUB)
-    return visits, subs, unsubs
+async def any_event_with_qr(
+    qr_id: str,
+    dt_from: datetime,
+    dt_to: datetime,
+) -> bool:
+    """Проверяет стримингом, встречается ли указанный qr_id в событиях за период."""
+    qr_l = qr_id.lower()
+    async for ev in api_search_async(qr_id, dt_from, dt_to, limit=500):
+        payload = ev.get("payload") or {}
+        ev_qr = (payload.get("qr_id") or payload.get("qrId") or "").lower()
+        if ev_qr == qr_l:
+            return True
+    return False
 
-def summarize_counts_by_qr(events: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int, int]]:
+
+async def summarize_counts_by_qr_stream(
+    dt_from: datetime,
+    dt_to: datetime,
+    qr_id: Optional[str] = None,
+) -> Dict[str, Tuple[int, int, int]]:
     """
-    Считает V/S/U по каждому qr (строго из e.payload.qr_id).
-    События без qr_id кладём в ключ "unknown".
+    Потоковый аналог summarize_counts_by_qr: без хранения всех events.
     """
     buckets = defaultdict(lambda: [0, 0, 0])  # [visits, subs, unsubs]
-    for e in events:
-        q = e.get("payload", {}).get("qr_id")
+    async for ev in api_search_async(qr_id, dt_from, dt_to):
+        q = ev.get("payload", {}).get("qr_id")
         if q is None:
             continue
-        et = e.get("event_type")
+        et = ev.get("event_type")
         if et in EVENT_VISIT:
             buckets[q][0] += 1
         elif et in EVENT_SUB:
             buckets[q][1] += 1
         elif et in EVENT_UNSUB:
             buckets[q][2] += 1
-
     return {q: (v[0], v[1], v[2]) for q, v in buckets.items()}
 
-def escape_md(text: str) -> str:
-    return escape_markdown(text, version=2)
 
-
-def build_stats_message(
-    qr_id: str, dt_from: datetime, dt_to: datetime, events: List[Dict[str, Any]]
+def build_summary_message_stream_markdown(
+    qr_id: str,
+    dt_from: datetime,
+    dt_to: datetime,
+    visits: int,
+    subs: int,
+    unsubs: int,
+    link_markdown: str | None = None,
 ) -> str:
-    users = group_user_events(events)
-    visits, subs, unsubs = summarize_counts(events)
-    lines = []
-    lines.append(
-        f"📍 Статистика по {qr_id.upper().replace('QR', 'QR-') if not qr_id.upper().startswith('QR') else qr_id.upper()}"
-    )
-    lines.append(f"📅 Период : {fmt_local(dt_from)} - {fmt_local(dt_to)}")
-
-    if users:
-        for idx, (uid, b) in enumerate(users.items(), start=1):
-            fio = f"{b['last_name']} {b['first_name']}".strip() or f"ID {uid}"
-            lines.append(f"{idx}. {fio}")
-            for ts, etype, payload in b["events"]:
-                if etype in EVENT_VISIT:
-                    lines.append(f"{fmt_local(ts)} - посещение")
-                elif etype in EVENT_SUB:
-                    lines.append(f"{fmt_local(ts)} - подписка")
-                elif etype in EVENT_UNSUB:
-                    lines.append(f"{fmt_local(ts)} - отписка")
-                else:
-                    lines.append(f"{fmt_local(ts)} - событие: {etype}")
-            lines.append(f"Подписался: {'да' if b['subscribed_in_range'] else 'нет'}")
-            lines.append(f'Ссылка: "{b["link"]}"')
-    else:
-        lines.append("Нет событий за указанный период.")
-
-    lines.append("Итог:")
-    lines.append(f"Посещений: {visits}")
-    lines.append(f"Подписок: {subs}")
-    lines.append(f"Отписок: {unsubs}")
-    return "\n".join(lines)
-
-
-def build_summary_message(
-    qr_id: str, dt_from: datetime, dt_to: datetime, events: List[Dict[str, Any]]
-) -> str:
-    visits, subs, unsubs = summarize_counts(events)
-    link = build_stats_link(qr_id, dt_from, dt_to)
-    pretty_link = escape_md(link) if link else ""
-
     lines = [
         f"📍 *{escape_md(qr_id.upper().replace('QR', 'QR-'))}*",
         f"📅 Период: {escape_md(fmt_local(dt_from))} – {escape_md(fmt_local(dt_to))}",
@@ -279,9 +349,33 @@ def build_summary_message(
         f"Подписок: *{subs}*",
         f"Отписок: *{unsubs}*",
     ]
-    if pretty_link:
+    if link_markdown:
         lines.append("")
-        lines.append(pretty_link)
+        # важно: не прогонять через escape_md — иначе сломаем синтаксис ссылки
+        lines.append(link_markdown)
+    return "\n".join(lines)
+
+def build_summary_message_stream_plain(
+    qr_id: str,
+    dt_from: datetime,
+    dt_to: datetime,
+    visits: int,
+    subs: int,
+    unsubs: int,
+    url: str | None = None,
+) -> str:
+    lines = [
+        f"📍 {qr_id.upper().replace('QR', 'QR-')}",
+        f"📅 Период: {fmt_local(dt_from)} – {fmt_local(dt_to)}",
+        "",
+        "Итог:",
+        f"Посещений: {visits}",
+        f"Подписок: {subs}",
+        f"Отписок: {unsubs}",
+    ]
+    if url:
+        lines.append("")
+        lines.append(url)  # отправляем «как есть»
     return "\n".join(lines)
 
 
@@ -307,17 +401,29 @@ def split_message(s: str, limit: int = 4000) -> Iterable[str]:
 # FastAPI (async)
 # =========================
 
-class EventOutDict(Dict[str, Any]): ...
-class UserOutDict(Dict[str, Any]): ...
-class StatsOutDict(Dict[str, Any]): ...
+class EventOutDict(Dict[str, Any]):
+    ...
+
+
+class UserOutDict(Dict[str, Any]):
+    ...
+
+
+class StatsOutDict(Dict[str, Any]):
+    ...
+
 
 app = FastAPI(title="QR Stats API")
+
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-@app.get("/stats/{qr_id}/from={from_iso}&to={to_iso}", response_class=HTMLResponse)
+
+@app.get(
+    "/stats/{qr_id}/from={from_iso}&to={to_iso}", response_class=HTMLResponse
+)
 async def http_stats(qr_id: str, from_iso: str, to_iso: str, request: Request):
     try:
         dt_from = dateparser.isoparse(from_iso)
@@ -336,11 +442,9 @@ async def http_stats(qr_id: str, from_iso: str, to_iso: str, request: Request):
         )
 
     try:
-        data = await api_search_async(qr_id, dt_from, dt_to)
-        events = data.get("events") or []
-
-        users = group_user_events(events)
-        visits, subs, unsubs = summarize_counts(events)
+        users, visits, subs, unsubs, events_count = await fold_users_and_counts(
+            qr_id, dt_from, dt_to
+        )
 
         context = {
             "request": request,
@@ -353,10 +457,12 @@ async def http_stats(qr_id: str, from_iso: str, to_iso: str, request: Request):
             "subs": subs,
             "unsubs": unsubs,
             "users": users,
-            "events_count": len(events),
+            "events_count": events_count,
         }
         # Jinja рендер — синхронный; выносим в поток, чтобы не блокировать loop
-        return await run_in_threadpool(templates.TemplateResponse, "stats.html", context)
+        return await run_in_threadpool(
+            templates.TemplateResponse, "stats.html", context
+        )
 
     except httpx.HTTPError as e:
         return templates.TemplateResponse(
@@ -380,6 +486,7 @@ async def http_stats(qr_id: str, from_iso: str, to_iso: str, request: Request):
 DB_PATH = str(pathlib.Path(DATABASE_PATH).resolve())
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
@@ -392,6 +499,7 @@ async def init_db():
         )
         await conn.commit()
 
+
 async def add_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
@@ -399,14 +507,20 @@ async def add_chat_async(chat_id: int):
         )
         await conn.commit()
 
+
 async def remove_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("DELETE FROM digest_chats WHERE chat_id = ?", (chat_id,))
+        await conn.execute(
+            "DELETE FROM digest_chats WHERE chat_id = ?", (chat_id,)
+        )
         await conn.commit()
+
 
 async def list_chats_async() -> list[int]:
     async with aiosqlite.connect(DB_PATH) as conn:
-        cur = await conn.execute("SELECT chat_id FROM digest_chats ORDER BY chat_id")
+        cur = await conn.execute(
+            "SELECT chat_id FROM digest_chats ORDER BY chat_id"
+        )
         rows = await cur.fetchall()
         return [r[0] for r in rows]
 
@@ -431,11 +545,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
     else:
-        # Пробуем формат без даты (/stats qr1)
+        # Формат без даты (/stats qr1) — за сегодня
         m_today = STATS_TODAY_RE.match(text)
         if m_today:
             qr_id = m_today.group(1)
-            # Берем сегодняшний день с 00:00 до текущего момента
             now_loc = datetime.now(LOCAL_TZ)
             dt_from = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
             dt_to = now_loc
@@ -448,35 +561,15 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     try:
-        data = await api_search_async(qr_id, dt_from, dt_to)
-        events = data.get("events") or []
+        users, visits, subs, unsubs, events_count = await fold_users_and_counts(
+            qr_id, dt_from, dt_to
+        )
 
-        # Проверяем, есть ли события с таким qr_id
-        qr_exists = False
-        for ev in events:
-            payload = ev.get("payload") or {}
-            ev_qr = payload.get("qr_id") or payload.get("qrId")
-            if ev_qr and ev_qr.lower() == qr_id.lower():
-                qr_exists = True
-                break
-
-        # Если событий нет вообще или нет событий с таким qr_id, проверяем существование
-        if not events or not qr_exists:
-            # Делаем запрос на большой период (последний год) для проверки существования
+        # Проверка существования QR если пусто
+        if events_count == 0:
             check_from = datetime.now(LOCAL_TZ) - timedelta(days=365)
             check_to = datetime.now(LOCAL_TZ)
-            check_data = await api_search_async(qr_id, check_from, check_to)
-            check_events = check_data.get("events") or []
-
-            # Проверяем, есть ли вообще такой QR в системе
-            qr_found_ever = False
-            for ev in check_events:
-                payload = ev.get("payload") or {}
-                ev_qr = payload.get("qr_id") or payload.get("qrId")
-                if ev_qr and ev_qr.lower() == qr_id.lower():
-                    qr_found_ever = True
-                    break
-
+            qr_found_ever = await any_event_with_qr(qr_id, check_from, check_to)
             if not qr_found_ever:
                 await update.message.reply_text(
                     f"❌ QR-код '{qr_id}' не найден в системе.\n"
@@ -484,10 +577,26 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        msg = build_summary_message(qr_id, dt_from, dt_to, events)
-        await update.message.reply_text(
-            msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True
-        )
+
+        link = build_stats_link(qr_id, dt_from, dt_to)
+
+        if link and not is_localhost_url(link):
+            link_md = make_markdown_link("Полная статистика", link)
+            msg = build_summary_message_stream_markdown(
+                qr_id, dt_from, dt_to, visits, subs, unsubs,
+                link_markdown=link_md
+            )
+            await update.message.reply_text(
+                msg, parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True
+            )
+        else:
+            # localhost / пустая ссылка — отправляем plain text «как есть»
+            msg = build_summary_message_stream_plain(
+                qr_id, dt_from, dt_to, visits, subs, unsubs, url=link or ""
+            )
+            await update.message.reply_text(msg, disable_web_page_preview=True)
+
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             await update.message.reply_text(
@@ -500,12 +609,16 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("stats_cmd failed")
         await update.message.reply_text(f"Ошибка при получении данных: {e}")
 
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я считаю статистику по QR.\n"
         "Формат запроса:\n"
-        "Каждый день в 21:00 МСК я отправляю сводку по всем QR."
+        "/stats qr1 — статистика за сегодня\n"
+        "/stats qr1 DD.MM.YYYY HH:MM - DD.MM.YYYY HH:MM — за период\n"
+        "Каждый день в 21:00 МСК я отправляю сводку по всем QR (если включено)."
     )
+
 
 async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -516,16 +629,18 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
     day_end = day_start + timedelta(days=1) - timedelta(milliseconds=1)
 
     try:
-        results = await api_search_async(None, day_start, day_end)
-        events = results.get("events") or []
-        per_qr = summarize_counts_by_qr(events)
+        per_qr = await summarize_counts_by_qr_stream(
+            day_start, day_end, qr_id=None
+        )
+
         lines = ["Статистика по всем QR за сегодня.\n"]
-        for qr_id, (visits, subs, unsubs) in per_qr.items():
-            lines.append(f"{qr_id}:")
-            lines.append(f"Посещений: {visits}")
-            lines.append(f"Подписок: {subs}")
-            lines.append(f"Отписок: {unsubs}\n")
-        if not per_qr:
+        if per_qr:
+            for qr_id, (visits, subs, unsubs) in per_qr.items():
+                lines.append(f"{qr_id}:")
+                lines.append(f"Посещений: {visits}")
+                lines.append(f"Подписок: {subs}")
+                lines.append(f"Отписок: {unsubs}\n")
+        else:
             lines.append("Событий не найдено.")
         msg = "\n".join(lines)
 
@@ -550,10 +665,10 @@ async def enable_digest_for_chat(update, context):
     for j in context.job_queue.get_jobs_by_name(f"digest_{chat_id}"):
         j.schedule_removal()
 
-    # планируем
+    # планируем (21:00 МСК = 00:00 МСК+3 — оставим твои времена)
     context.job_queue.run_daily(
         callback=daily_digest,
-        time=time(hour=0, minute=50, tzinfo=LOCAL_TZ),
+        time=time(hour=21, minute=0, tzinfo=LOCAL_TZ),
         name=f"digest_{chat_id}",
         data={"chat_id": chat_id},
         job_kwargs={"misfire_grace_time": 300, "coalesce": True},
@@ -577,7 +692,6 @@ async def disable_digest_for_chat(update, context):
     )
 
 
-# === создание и запуск Telegram-приложения (в lifecycle FastAPI) ===
 _tg_app: Optional[Application] = None
 
 
@@ -594,7 +708,7 @@ async def _start_telegram():
     for chat_id in await list_chats_async():
         _tg_app.job_queue.run_daily(
             callback=daily_digest,
-            time=time(hour=0, minute=55, tzinfo=LOCAL_TZ),
+            time=time(hour=21, minute=00, tzinfo=LOCAL_TZ),
             name=f"digest_{chat_id}",
             data={"chat_id": chat_id},
             job_kwargs={"misfire_grace_time": 300, "coalesce": True},
@@ -611,6 +725,7 @@ async def _start_telegram():
     await _tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     log.info("Telegram bot started")
 
+
 async def _stop_telegram():
     if _tg_app:
         await _tg_app.updater.stop()
@@ -618,29 +733,22 @@ async def _stop_telegram():
         await _tg_app.shutdown()
         log.info("Telegram bot stopped")
 
-# =========================
-# FastAPI lifecycle (один event loop)
-# =========================
 
 @app.on_event("startup")
 async def on_startup():
     ensure_config()
-    # HTTP-клиент
     global _http_client
     _http_client = httpx.AsyncClient()
-    # Telegram в фоне
     await _start_telegram()
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # гасим бота
     await _stop_telegram()
-    # закрываем http-клиент
     global _http_client
     if _http_client:
         await _http_client.aclose()
         _http_client = None
-    # гасим задачу, если осталась
     tg = getattr(app.state, "tg_task", None)
     if tg:
         tg.cancel()
