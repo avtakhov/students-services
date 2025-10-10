@@ -28,7 +28,7 @@ class UserQr(Base):
     __tablename__ = "user_qr"
 
     vk_user_id = Column(ForeignKey("users.vk_user_id"), primary_key=True)
-    qr_id = Column(String, primary_key=True)
+    qr_id = Column(String, nullable=False)
 
     __table_args__ = (
         Index("idx_user_qr_vk_user_id", "vk_user_id"),
