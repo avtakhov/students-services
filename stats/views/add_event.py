@@ -28,7 +28,7 @@ async def _add_user_qr(vk_user_id: int, qr_id: str, session: AsyncSession):
             qr_id=qr_id,
         )
         .on_conflict_do_update(
-            index_elements=[UserQr.vk_user_id, UserQr.qr_id],
+            index_elements=[UserQr.vk_user_id],
             set_={
                 "qr_id": UserQr.qr_id,
             },
