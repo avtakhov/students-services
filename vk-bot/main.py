@@ -24,7 +24,7 @@ VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
 VK_GROUP_ID_RAW = os.getenv("VK_GROUP_ID", "").strip()
 SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000").rstrip("/")
 
-# Жёстко работаем только в LongPoll
+
 if not VK_TOKEN:
     raise RuntimeError("VK_TOKEN пуст. Укажите групповой токен в .env")
 
@@ -34,8 +34,8 @@ except ValueError:
     raise RuntimeError(f"VK_GROUP_ID должен быть числом, получили: {VK_GROUP_ID_RAW!r}")
 
 API_VERSION = os.getenv("VK_API_VERSION", "5.199")
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5.0"))  # секунд
-LP_RETRY_DELAY = float(os.getenv("LP_RETRY_DELAY", "3.0"))    # секунд между переподключениями
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5.0"))
+LP_RETRY_DELAY = float(os.getenv("LP_RETRY_DELAY", "3.0"))
 
 # ===================== BOT CORE =====================
 
@@ -68,7 +68,6 @@ class VKPromoBot:
 
     def _get_user_info(self, user_id: int):
         try:
-            # users.get поддерживается для ботов
             info = self.vk.users.get(user_ids=user_id)[0]
             return info
         except Exception as e:
@@ -107,7 +106,7 @@ class VKPromoBot:
 
     @staticmethod
     def _extract_qr_id_from_message(message_obj: dict) -> str | None:
-        # 1) payload
+
         payload = message_obj.get("payload")
         if payload:
             try:
@@ -117,28 +116,44 @@ class VKPromoBot:
                     return str(qr)
             except Exception:
                 pass
-        # 2) ref / ref_source (если прилетает из m.vk.com/…)
+
         ref = message_obj.get("ref") or message_obj.get("ref_source")
         return str(ref) if ref else None
 
+    def _is_first_message(self, user_id: int) -> bool:
+
+        try:
+            history = self.vk.messages.getHistory(
+                user_id=user_id,
+                count=2
+            )
+
+
+            message_count = history.get("count", 0)
+
+            logger.debug("История для user_id=%s: count=%s", user_id, message_count)
+
+            return message_count <= 1
+
+        except Exception as e:
+            logger.error("Ошибка при получении истории для user_id=%s: %s", user_id, e)
+
+            return False
     # -------- HANDLERS --------
 
     def handle_message_new(self, obj: dict):
         message = obj.get("message", obj)
 
-        # 2) user_id берём из from_id (peer_id — это беседы/диалоги, нам нужен именно пользователь)
         user_id = message.get("from_id")
         if not user_id:
             return
 
-        # 3) Пытаемся получить информацию о пользователе
         user = self._get_user_info(user_id)
         if not user:
             return
 
         ref = None
 
-        # 4.1) payload может быть str (JSON) или dict
         payload = message.get("payload")
         if isinstance(payload, str):
             try:
@@ -147,40 +162,39 @@ class VKPromoBot:
                 payload = None
 
         if isinstance(payload, dict):
-            # стандартный кейс: {"ref": "promoter_002", ...}
+
             ref = payload.get("ref") or payload.get("qr_id") or payload.get(
                 "key"
                 )
 
-        # 4.2) запасные поля от VK (на всякий)
+
         if not ref:
             ref = (message.get("ref")
                    or obj.get("ref")
                    or message.get("ref_source")
                    or obj.get("ref_source"))
 
-        # 5) Формируем событие Link (как у тебя было), но от message_new
+
         event_payload = {"qr_id": ref} if ref else None
         if event_payload:
             event = self._build_event("Link", user, event_payload)
             self._post_event(event)
 
-        text = (
-            "Привет, студент! 👋\n"
-            "Мы помогаем с любыми видами академических работ.\n"
-            "Хочешь получить бесплатную работу?\n"
-            "[https://vk.com/app7685942_-220116264|👉Крути рулетку]\n"
-            "Если нужна помощь прямо сейчас — просто напиши сюда ✍️\n"
-            "Для подписчиков действует скидка 30% на первый заказ!\n"            
-            "[https://vk.com/studgenius|👉Подписаться]\n"
-            "Твой личный менеджер ответит в течение 3 минут.\n"
-            "Чтобы мы быстрее поняли, что тебе нужно, укажи кодовое слово: курсовая, статья или диплом."
-        )
-        # 6) Отправляем приветствие (можешь ограничить по условию, если надо)
-        self._send_message(
-            user_id,
-            text
-        )
+        if self._is_first_message(user_id):
+            welcome_message = (
+                "Привет, студент! 👋\n"
+                "Мы помогаем с любыми видами академических работ.\n"
+                "Хочешь получить бесплатную работу?\n"
+                "[https://vk.com/app7685942_-220116264|👉Крути рулетку]\n"
+                "Если нужна помощь прямо сейчас — просто напиши сюда ✍️\n"
+                "Для подписчиков действует скидка 30% на первый заказ!\n"            
+                "[https://vk.com/studgenius|👉Подписаться]\n"
+                "Твой личный менеджер ответит в течение 3 минут.\n"
+                "Чтобы мы быстрее поняли, что тебе нужно, укажи кодовое слово: курсовая, статья или диплом."
+            )
+            self._send_message(user_id, welcome_message)
+            logger.info("Отправлено приветствие новому пользователю: %s", user_id)
+
     def handle_group_join(self, obj: dict):
         user_id = obj.get("user_id")
         if not user_id:
@@ -194,7 +208,7 @@ class VKPromoBot:
         event = self._build_event("Subscribe", user, {"join_type": join_type} if join_type else None)
         self._post_event(event)
 
-        #self._send_message(user_id, "Спасибо за подписку! Вы теперь в теме всех новостей ✨")
+
 
     def handle_group_leave(self, obj: dict):
         user_id = obj.get("user_id")
@@ -221,7 +235,6 @@ class VKPromoBot:
                     try:
                         et = event.type
 
-                        # Логируем сырое событие один раз — помогает дебажить
                         logging.debug("RAW EVENT: %s | object=%s", et, getattr(event, "object", None))
 
                         if et == VkBotEventType.MESSAGE_NEW:
@@ -244,7 +257,6 @@ class VKPromoBot:
                 logger.info("Остановка по Ctrl+C")
                 break
             except Exception as e:
-                # Сеть/401/timeout — ждём и пересоздаём longpoll
                 logger.error("LongPoll отвалился: %s — переподключаюсь через %.1fs", e, LP_RETRY_DELAY)
                 time.sleep(LP_RETRY_DELAY)
                 try:
